@@ -5,3 +5,7 @@ queries/subset.jsonl
 *.pkl
 plots/*.pdf
 annotations
+GPT*
+*.json
+*.pyc
+__pycache__/eval_citation_async.cpython-312.pyc

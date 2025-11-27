@@ -11,11 +11,9 @@ import asyncio
 import re
 from enum import Enum
 from typing import List
-from dotenv import load_dotenv
-import logging
 
-load_dotenv("keys.env")
-client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"), base_url=os.getenv("OPENAI_BASE_URL"))
 
 class ClaimEntry(BaseModel):
     claim_id: int
@@ -71,15 +69,16 @@ Now extract the claims from the report below:
 Return the JSON object, and nothing else.
 """
 
-async def extract_claims_and_url(openai_semaphore, answer, model):
-    async with openai_semaphore:
+async def extract_claims_and_url(semaphore, answer, model):
+    async with semaphore:
         prompt = create_prompt_extractor(answer)
         response = await client.beta.chat.completions.parse(
             model=model,
             messages=[{"role": "system", "content": "You are a helpful assistant."},
                     {"role": "user", "content": prompt}],
             response_format=ClaimsModel,
-            temperature=0
+            temperature=0,
+            seed=42,
         )
         try:
             return json.loads(response.choices[0].message.content)["claims"]
@@ -87,7 +86,7 @@ async def extract_claims_and_url(openai_semaphore, answer, model):
             print("Could not parse JSON - extractor")
             return {}
 
-async def evaluate_query(openai_semaphore, query_id, answer_path, model):
+async def evaluate_query(semaphore, query_id, answer_path, model):
     with open(answer_path, "r", encoding="utf-8") as f:
         answer = f.read().strip()
 
@@ -95,7 +94,7 @@ async def evaluate_query(openai_semaphore, query_id, answer_path, model):
     if not re.search(url_pattern, answer):
         return query_id, {"score": 0, "detailed": "No URLs found in text."}
 
-    claims_to_urls = await extract_claims_and_url(openai_semaphore, answer, model)
+    claims_to_urls = await extract_claims_and_url(semaphore, answer, model)
 
     if not claims_to_urls:
         return query_id, {"score": 0.0, "detailed": "No claims extracted."}
@@ -116,18 +115,10 @@ async def evaluate_query(openai_semaphore, query_id, answer_path, model):
 
     return query_id, {"score": score, "detailed": detailed}
 
-async def evaluate_folder_async(subfolder_name, model, path_to_reports):
-    folder_path = Path(path_to_reports) / subfolder_name
-    output_file = folder_path / f"evaluation_results_citation_recall_{model}.json"
-
+async def evaluate_folder_async(path_to_reports, model, num_workers=32):
+    folder_path = Path(path_to_reports)
     all_results = {}
-    if output_file.exists():
-        with open(output_file, "r", encoding="utf-8") as f:
-            all_results = json.load(f)
-
-    print(f"Skipped {len(all_results)} queries.")
-
-    openai_semaphore = asyncio.Semaphore(100)
+    semaphore = asyncio.Semaphore(num_workers)
 
     query_files = list(folder_path.glob("*.a"))
     tasks = []
@@ -135,7 +126,7 @@ async def evaluate_folder_async(subfolder_name, model, path_to_reports):
         query_id = file.stem
         if query_id in all_results:
             continue
-        tasks.append(evaluate_query(openai_semaphore, query_id, file, model))
+        tasks.append(evaluate_query(semaphore, query_id, file, model))
 
     results = await tqdm_asyncio.gather(*tasks)
     for query_id, result in results:
@@ -144,21 +135,23 @@ async def evaluate_folder_async(subfolder_name, model, path_to_reports):
     average_score = sum(r["score"] for r in all_results.values()) / len(all_results) if all_results else 0
     return all_results, average_score
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--subfolder")
-    parser.add_argument("--open_ai_model")
-    args = parser.parse_args()
+async def evaluate_files(files, model, num_workers=32):
+    semaphore = asyncio.Semaphore(num_workers)
+    tasks = []
 
-    path_to_reports = "/data/group_data/cx_group/deepsearch_benchmark/reports/"
-    print(f"Evaluating {args.subfolder} using {args.open_ai_model}")
-    results, avg = asyncio.run(evaluate_folder_async(args.subfolder, args.open_ai_model, path_to_reports))
+    for file in files:
+        query_id = Path(file).stem
+        tasks.append(evaluate_query(semaphore, query_id, file, model))
 
-    print(f"Evaluated {len(results)} queries.")
+    results = await tqdm_asyncio.gather(*tasks)
+    all_results = {query_id: result for query_id, result in results}
 
-    output_path = Path(path_to_reports) / args.subfolder / f"evaluation_results_citation_recall_{args.open_ai_model}.json"
-    with open(output_path, "w", encoding="utf-8") as f:
-        json.dump(results, f, indent=2, ensure_ascii=False)
+    average_score = sum(r["score"] for r in all_results.values()) / len(all_results) if all_results else 0
+    return all_results, average_score
+
+def analyze_results(output_file):
+    with open(output_file, "r", encoding="utf-8") as f:
+        results = json.load(f)
 
     total_score = 0
     count = 0
@@ -171,4 +164,42 @@ if __name__ == "__main__":
     average_score = total_score / count if count > 0 else 0
     print(f"\nAverage normalized citation recall score across {count} queries: {average_score:.2f}")
 
-    print(f"\nSaved detailed evaluation results to {output_path}")
+    return average_score
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--dir")
+    parser.add_argument("--output")
+    parser.add_argument("--open_ai_model")
+    parser.add_argument("--times", type=int, default=1, help="Number of times to run the evaluation")
+    args = parser.parse_args()
+
+    if args.times == 1:
+        print(f"Evaluating {args.dir} using {args.open_ai_model}")
+
+        output_path = os.path.join(Path(args.dir),  f"faithfulness_recall_{args.open_ai_model}.json")
+
+        results, avg = asyncio.run(evaluate_folder_async(args.dir, args.open_ai_model))
+
+        print(f"Evaluated {len(results)} queries.")
+
+        with open(output_path, "w", encoding="utf-8") as f:
+            json.dump(results, f, indent=2, ensure_ascii=False)
+
+        print(f"\nSaved detailed evaluation results to {output_path}")
+
+        analyze_results(output_path)
+    
+    else:
+        all_results = []
+        for i in range(args.times):
+            output_path = os.path.join(Path(args.dir), f"faithfulness_recall_{args.open_ai_model}_run_{i+1}.json")
+            results, avg = asyncio.run(evaluate_folder_async(args.dir, args.open_ai_model))
+            all_results.append(results)
+
+            with open(output_path, "w", encoding="utf-8") as f:
+                json.dump(results, f, indent=2, ensure_ascii=False)
+            # Analyze results across all runs
+            all_results.append(analyze_results(output_path))
+        average_results = sum(all_results) / len(all_results) if all_results else 0
+        print(f"\nAverage results across {args.times} runs: {average_results:.2f}")

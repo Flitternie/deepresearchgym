@@ -6,12 +6,9 @@ from typing import Literal, List
 from tqdm.asyncio import tqdm_asyncio
 from pydantic import create_model
 from openai import AsyncOpenAI
-from dotenv import load_dotenv
 import os
 
-
-load_dotenv("keys.env")
-client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"), base_url=os.getenv("OPENAI_BASE_URL"))
 
 EVAL_CRITERIA = [
     {
@@ -87,7 +84,8 @@ async def evaluate_single_criterion(semaphore, criterion, question, answer, mode
                     model=model,
                     messages=chat_pattern,
                     response_format=CriterionEvaluation,
-                    temperature=0
+                    temperature=0,
+                    seed=42,
         )
         result = json.loads(response.choices[0].message.content)
         return criterion['name'], (result['rating'], result['justification'])
@@ -117,18 +115,10 @@ async def evaluate_query(semaphore, query_id, folder_path, model):
         print(f"Error evaluating {query_id}: {e}")
         return query_id, None
 
-async def evaluate_folder_async(subfolder_name, model, path_to_reports):
-    folder_path = Path(path_to_reports) / subfolder_name
-    output_file = folder_path / f"evaluation_results_detailed_{model}.json"
-
+async def evaluate_folder_async(path_to_reports, model, num_workers=32):
+    folder_path = Path(path_to_reports)
     all_results = {}
-    if output_file.exists():
-        with open(output_file, "r", encoding="utf-8") as f:
-            all_results = json.load(f)
-
-    print(f"Skipped queries: {len(all_results)}")
-
-    semaphore = asyncio.Semaphore(100)
+    semaphore = asyncio.Semaphore(num_workers)  # Limit concurrent evaluations
 
     query_ids = [p.stem for p in folder_path.glob("*.q") if p.stem not in all_results]
     tasks = [evaluate_query(semaphore, qid, folder_path, model) for qid in query_ids]
@@ -140,20 +130,24 @@ async def evaluate_folder_async(subfolder_name, model, path_to_reports):
 
     return all_results
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--subfolder")
-    parser.add_argument("--open_ai_model")
-    args = parser.parse_args()
+async def evaluate_files(files, model, num_workers=32):
+    semaphore = asyncio.Semaphore(num_workers)  # Limit concurrent evaluations
+    tasks = [evaluate_query(semaphore, Path(f).stem, Path(f).parent, model) for f in files]
+    results = await tqdm_asyncio.gather(*tasks)
 
-    path_to_reports = "/data/group_data/cx_group/deepsearch_benchmark/reports/"
+    all_results = {}
+    for query_id, result in results:
+        if result is not None:
+            all_results[query_id] = result
+        else:
+            print(f"Warning: No result for query {query_id}")
 
-    print(f"Evaluating {args.subfolder} using {args.open_ai_model}")
-    results = asyncio.run(evaluate_folder_async(args.subfolder, args.open_ai_model, path_to_reports))
+    return all_results
 
-    detailed_path = Path(path_to_reports) / args.subfolder / f"evaluation_results_detailed_{args.open_ai_model}.json"
-    with open(detailed_path, "w", encoding="utf-8") as f:
-        json.dump(results, f, indent=2, ensure_ascii=False)
+
+def analyze_results(output_path):
+    with open(output_path, "r", encoding="utf-8") as f:
+        results = json.load(f)
 
     total_score = 0
     count = 0
@@ -180,6 +174,11 @@ if __name__ == "__main__":
             per_criterion_totals[criterion_name] += rating
             per_criterion_counts[criterion_name] += 1
 
+
+    output_results = {
+        "average_normalized_score": average_score
+    }
+
     # Compute per-criterion averages (0–10) and normalized (0–100)
     print("\nPer-criterion average scores across all queries:")
     for criterion_name in per_criterion_totals:
@@ -188,5 +187,51 @@ if __name__ == "__main__":
         avg_rating = total / count if count > 0 else 0
         normalized_avg = (avg_rating / 10) * 100
         print(f"{criterion_name}: {avg_rating:.2f} / 10  ({normalized_avg:.2f} / 100)")
+        output_results[criterion_name] = {
+            "average_rating": avg_rating,
+            "normalized_average": normalized_avg
+        }
 
-    print(f"\nSaved detailed evaluation results to {detailed_path}")
+    return output_results
+
+async def main(args):
+    if args.times == 1:
+        print(f"Evaluating {args.dir} using {args.open_ai_model}")
+        output_path = os.path.join(args.output, f"quality_{args.open_ai_model}.json")
+
+        results = await evaluate_folder_async(args.dir, args.open_ai_model)
+        with open(output_path, "w", encoding="utf-8") as f:
+            json.dump(results, f, indent=2, ensure_ascii=False)
+
+        print(f"\nSaved detailed evaluation results to {output_path}")
+        analyze_results(output_path)
+    else:
+        overall_results = []
+        for i in range(args.times):
+            output_path = os.path.join(args.output, f"quality_{args.open_ai_model}_{i+1}.json")
+            results = await evaluate_folder_async(args.dir, args.open_ai_model)
+            with open(output_path, "w", encoding="utf-8") as f:
+                json.dump(results, f, indent=2, ensure_ascii=False)
+            results = analyze_results(output_path)
+            overall_results.append(results)
+        # print overall results by averaging across all runs per criterion
+        print("\nOverall average results across all runs:")
+        for keys in overall_results[0].keys():
+            average_rating = sum(res[keys]['average_rating'] for res in overall_results) / len(overall_results)
+            normalized_avg = sum(res[keys]['normalized_average'] for res in overall_results) / len(overall_results)
+            print(f"{keys}: {average_rating:.2f} / 10  ({normalized_avg:.2f} / 100)")
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--dir")
+    parser.add_argument("--output")
+    parser.add_argument("--open_ai_model")
+    parser.add_argument("--times", type=int, default=1, help="Number of times to run the evaluation")
+    args = parser.parse_args()
+
+    asyncio.run(main(args))
+
+
+
+
+            

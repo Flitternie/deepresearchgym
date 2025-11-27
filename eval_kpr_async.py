@@ -10,9 +10,7 @@ from dotenv import load_dotenv
 import os
 
 
-load_dotenv("keys.env")
-client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-
+client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"), base_url=os.getenv("OPENAI_BASE_URL"))
 
 
 def create_prompt(key_point, answer):
@@ -58,7 +56,8 @@ async def evaluate_single_key_point(semaphore, key_point, answer, model):
                     model=model,
                     messages=chat_pattern,
                     response_format=KeyPointRecall,
-                    temperature=0
+                    temperature=0,
+                    seed=42,
         )
         result = json.loads(response.choices[0].message.content)
         return key_point["point_number"], (result['label'], result['justification'])
@@ -93,19 +92,11 @@ async def evaluate_query(semaphore, query_id, anwser_dir, key_point_dir, model):
         print(f"Error evaluating {query_id}: {e}")
         return query_id, None
 
-async def evaluate_folder_async(subfolder_name, model, path_to_reports, key_point_dir):
-    folder_path = Path(path_to_reports) / subfolder_name
-    output_file = folder_path / f"evaluation_results_kpr_{model}.json"
+async def evaluate_folder_async(path_to_reports, model, key_point_dir, num_workers=32):
+    folder_path = Path(path_to_reports)
     key_point_dir = Path(key_point_dir)
-
     all_results = {}
-    if output_file.exists():
-        with open(output_file, "r", encoding="utf-8") as f:
-            all_results = json.load(f)
-
-    print(f"Skipped queries: {len(all_results)}")
-
-    semaphore = asyncio.Semaphore(100)
+    semaphore = asyncio.Semaphore(num_workers)
 
     query_ids = [p.stem for p in folder_path.glob("*.q") if p.stem not in all_results]
     query_ids = query_ids
@@ -118,18 +109,22 @@ async def evaluate_folder_async(subfolder_name, model, path_to_reports, key_poin
 
     return all_results
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--subfolder")
-    parser.add_argument("--open_ai_model")
-    args = parser.parse_args()
+async def evaluate_files(files, model, key_point_dir="./deepresearch_benchmarking/key_point", num_workers=32):
+    key_point_dir = Path(key_point_dir)
+    semaphore = asyncio.Semaphore(num_workers)
+    tasks = [evaluate_query(semaphore, Path(f).stem, Path(f).parent, key_point_dir, model) for f in files]
+    results = await tqdm_asyncio.gather(*tasks)
+    all_results = {}
+    for query_id, result in results:
+        if result is not None:
+            all_results[query_id] = result
+        else:
+            print(f"Warning: No result for query {query_id}")
+    return all_results
 
-    path_to_reports = "/data/group_data/cx_group/deepsearch_benchmark/reports/"
-    path_to_results = "/data/group_data/cx_group/deepsearch_benchmark/reports/"
-    path_to_key_point = "key_point"
-
-    print(f"Evaluating {args.subfolder} using {args.open_ai_model}")
-    results = asyncio.run(evaluate_folder_async(args.subfolder, args.open_ai_model, path_to_reports, path_to_key_point))
+def analyze_results(output_path):
+    with open(output_path, "r", encoding="utf-8") as f:
+        results = json.load(f)
 
     total_support_rate = 0
     total_omitted_rate = 0
@@ -171,13 +166,53 @@ if __name__ == "__main__":
     print(f"  Average support rate: {avg_support:.2f}%")
     print(f"  Average omitted rate: {avg_omitted:.2f}%")
     print(f"  Average contradicted rate: {avg_contradicted:.2f}%")
-        
-    
-    result_dir = Path(path_to_results) / args.subfolder
-    result_dir.mkdir(parents=True, exist_ok=True)
-    
-    detailed_path = result_dir / f"evaluation_results_kpr_{args.open_ai_model}.json"
-    with open(detailed_path, "w", encoding="utf-8") as f:
-        json.dump(results, f, indent=2, ensure_ascii=False)
 
-    print(f"\nSaved detailed evaluation results to {detailed_path}")
+    return {
+        "average_support_rate": avg_support,
+        "average_omitted_rate": avg_omitted,
+        "average_contradicted_rate": avg_contradicted,
+    }
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--dir")
+    parser.add_argument("--output")
+    parser.add_argument("--open_ai_model")
+    parser.add_argument("--times", type=int, default=1, help="Number of times to run the evaluation")
+    args = parser.parse_args()
+
+    path_to_key_point = "./deepresearch_benchmarking/key_point"
+
+    result_dir = Path(args.output)
+    result_dir.mkdir(parents=True, exist_ok=True)
+
+    if args.times == 1:
+        output_path = os.path.join(result_dir, f"relevance_{args.open_ai_model}.json")
+
+        print(f"Evaluating {args.dir} using {args.open_ai_model}")
+        results = asyncio.run(evaluate_folder_async(args.dir, args.open_ai_model, path_to_key_point))
+            
+        with open(output_path, "w", encoding="utf-8") as f:
+            json.dump(results, f, indent=2, ensure_ascii=False)
+
+        print(f"\nSaved detailed evaluation results to {output_path}")
+
+        analyze_results(output_path)
+    else:
+        for i in range(args.times):
+            output_path = os.path.join(result_dir, f"relevance_{args.open_ai_model}_{i+1}.json")
+            results = asyncio.run(evaluate_folder_async(args.dir, args.open_ai_model, path_to_key_point))
+            
+            with open(output_path, "w", encoding="utf-8") as f:
+                json.dump(results, f, indent=2, ensure_ascii=False)
+
+            results = analyze_results(output_path)
+
+        # print the average results across all runs
+        avg_support = sum(r["average_support_rate"] for r in results) / args.times
+        avg_omitted = sum(r["average_omitted_rate"] for r in results) / args.times
+        avg_contradicted = sum(r["average_contradicted_rate"] for r in results) / args.times
+        print(f"\nAverage support rate across {args.times} runs: {avg_support:.2f}%")
+        print(f"Average omitted rate across {args.times} runs: {avg_omitted:.2f}%")
+        print(f"Average contradicted rate across {args.times} runs: {avg_contradicted:.2f}%")
